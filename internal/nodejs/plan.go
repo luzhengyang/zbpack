@@ -2,12 +2,16 @@ package nodejs
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"strconv"
 	"strings"
 
+	"github.com/goccy/go-yaml"
 	"github.com/moznion/go-optional"
 	"github.com/spf13/afero"
+	"github.com/spf13/cast"
 	"github.com/zeabur/zbpack/internal/utils"
 	"github.com/zeabur/zbpack/pkg/plan"
 	"github.com/zeabur/zbpack/pkg/types"
@@ -18,13 +22,19 @@ const (
 	// whether to cache dependencies.
 	// It is true by default.
 	ConfigCacheDependencies = "cache_dependencies"
+
+	// ConfigAppDir indicates the relative path of the app to deploy.
+	//
+	// For example, if the app to deploy is located at `apps/api`,
+	// the value of this configuration should be `apps/api`.
+	ConfigAppDir = "app_dir"
 )
 
 type nodePlanContext struct {
-	PackageJSON PackageJSON
-	Config      plan.ImmutableProjectConfiguration
-	Src         afero.Fs
-	Bun         bool
+	ProjectPackageJSON PackageJSON
+	Config             plan.ImmutableProjectConfiguration
+	Src                afero.Fs
+	Bun                bool
 
 	PackageManager  optional.Option[types.NodePackageManager]
 	Framework       optional.Option[types.NodeProjectFramework]
@@ -38,12 +48,50 @@ type nodePlanContext struct {
 	StartCmd        optional.Option[string]
 	StaticOutputDir optional.Option[string]
 	Serverless      optional.Option[bool]
+	// AppDir is the directory of the application to deploy.
+	AppDir optional.Option[string]
+	// AppPackageJSON is the package.json of the app to deploy.
+	AppPackageJSON optional.Option[PackageJSON]
+}
+
+// GetAppSource returns the source of the app to deploy of a Node.js project.
+//
+// A Node.js project may have a monorepo structure. In this case, the source
+// of the app to deploy may not be the root; instead, it should be `apps/somewhere`.
+//
+// This function returns the real application directory and the relative path of application to project.
+func (ctx *nodePlanContext) GetAppSource() (afero.Fs, string) {
+	appDir := GetMonorepoAppRoot(ctx)
+	if appDir == "" {
+		return ctx.Src, ""
+	}
+
+	return afero.NewBasePathFs(ctx.Src, appDir), appDir
+}
+
+// GetAppPackageJSON returns the package.json of the app to deploy of a Node.js project.
+func (ctx *nodePlanContext) GetAppPackageJSON() PackageJSON {
+	if cachedPackageJSON, err := ctx.AppPackageJSON.Take(); err == nil {
+		return cachedPackageJSON
+	}
+
+	src, relpath := ctx.GetAppSource()
+	if relpath != "" {
+		if packageJSON, err := DeserializePackageJSON(src); err == nil {
+			ctx.AppPackageJSON = optional.Some(packageJSON)
+			return packageJSON
+		}
+	}
+
+	ctx.AppPackageJSON = optional.Some(ctx.ProjectPackageJSON)
+	return ctx.AppPackageJSON.Unwrap()
 }
 
 // DeterminePackageManager determines the package manager of the Node.js project.
 func DeterminePackageManager(ctx *nodePlanContext) types.NodePackageManager {
 	src := ctx.Src
 	pm := &ctx.PackageManager
+	packageJSON := ctx.ProjectPackageJSON
 
 	if packageManager, err := pm.Take(); err == nil {
 		return packageManager
@@ -54,10 +102,10 @@ func DeterminePackageManager(ctx *nodePlanContext) types.NodePackageManager {
 		return pm.Unwrap()
 	}
 
-	if ctx.PackageJSON.PackageManager != nil {
+	if packageJSON.PackageManager != nil {
 		// [pnpm]@8.4.0
 		packageManagerSection := strings.SplitN(
-			*ctx.PackageJSON.PackageManager, "@", 2,
+			*packageJSON.PackageManager, "@", 2,
 		)
 
 		switch packageManagerSection[0] {
@@ -101,13 +149,18 @@ func DeterminePackageManager(ctx *nodePlanContext) types.NodePackageManager {
 	return pm.Unwrap()
 }
 
-// DetermineProjectFramework determines the framework of the Node.js project.
-func DetermineProjectFramework(ctx *nodePlanContext) types.NodeProjectFramework {
+// DetermineAppFramework determines the framework of the Node.js app.
+func DetermineAppFramework(ctx *nodePlanContext) types.NodeProjectFramework {
 	fw := &ctx.Framework
-	packageJSON := ctx.PackageJSON
+	packageJSON := ctx.GetAppPackageJSON()
 
 	if framework, err := fw.Take(); err == nil {
 		return framework
+	}
+
+	if _, isGrammY := packageJSON.Dependencies["grammy"]; isGrammY {
+		*fw = optional.Some(types.NodeProjectFrameworkGrammY)
+		return fw.Unwrap()
 	}
 
 	if _, isNuejs := packageJSON.Dependencies["nuejs-core"]; isNuejs {
@@ -115,8 +168,8 @@ func DetermineProjectFramework(ctx *nodePlanContext) types.NodeProjectFramework 
 		return fw.Unwrap()
 	}
 
-	if _, isAstro := packageJSON.Dependencies["astro"]; isAstro {
-		if _, hasZeaburAdapter := packageJSON.Dependencies["@zeabur/astro-adapter"]; hasZeaburAdapter {
+	if _, isAstro := packageJSON.FindDependency("astro"); isAstro {
+		if _, hasZeaburAdapter := packageJSON.FindDependency("@zeabur/astro-adapter"); hasZeaburAdapter {
 			*fw = optional.Some(types.NodeProjectFrameworkAstro)
 			return fw.Unwrap()
 		}
@@ -131,11 +184,6 @@ func DetermineProjectFramework(ctx *nodePlanContext) types.NodeProjectFramework 
 			return fw.Unwrap()
 		}
 
-		*fw = optional.Some(types.NodeProjectFrameworkAstroStatic)
-		return fw.Unwrap()
-	}
-
-	if _, isAstro := packageJSON.DevDependencies["astro"]; isAstro {
 		*fw = optional.Some(types.NodeProjectFrameworkAstroStatic)
 		return fw.Unwrap()
 	}
@@ -210,6 +258,11 @@ func DetermineProjectFramework(ctx *nodePlanContext) types.NodeProjectFramework 
 		return fw.Unwrap()
 	}
 
+	if _, isCreateReactApp := packageJSON.DevDependencies["react-scripts"]; isCreateReactApp {
+		*fw = optional.Some(types.NodeProjectFrameworkCreateReactApp)
+		return fw.Unwrap()
+	}
+
 	if _, isNuxtJs := packageJSON.Dependencies["nuxt"]; isNuxtJs {
 		*fw = optional.Some(types.NodeProjectFrameworkNuxtJs)
 		return fw.Unwrap()
@@ -258,16 +311,16 @@ func DetermineProjectFramework(ctx *nodePlanContext) types.NodeProjectFramework 
 	return fw.Unwrap()
 }
 
-// DetermineNeedPuppeteer determines whether the project needs Puppeteer.
+// DetermineNeedPuppeteer determines whether the app needs Puppeteer.
 func DetermineNeedPuppeteer(ctx *nodePlanContext) bool {
 	pup := &ctx.NeedPuppeteer
-	packageJSON := ctx.PackageJSON
+	appPackageJSON := ctx.GetAppPackageJSON()
 
 	if needPuppeteer, err := pup.Take(); err == nil {
 		return needPuppeteer
 	}
 
-	if _, hasPuppeteer := packageJSON.Dependencies["puppeteer"]; hasPuppeteer {
+	if _, hasPuppeteer := appPackageJSON.Dependencies["puppeteer"]; hasPuppeteer {
 		*pup = optional.Some(true)
 		return pup.Unwrap()
 	}
@@ -276,21 +329,21 @@ func DetermineNeedPuppeteer(ctx *nodePlanContext) bool {
 	return pup.Unwrap()
 }
 
-// DetermineNeedPlaywright determines whether the project needs Playwright.
+// DetermineNeedPlaywright determines whether the app needs Playwright.
 func DetermineNeedPlaywright(ctx *nodePlanContext) bool {
 	pw := &ctx.NeedPlaywright
-	packageJSON := ctx.PackageJSON
+	appPackageJSON := ctx.GetAppPackageJSON()
 
 	if needPlaywright, err := pw.Take(); err == nil {
 		return needPlaywright
 	}
 
-	if _, hasPlaywright := packageJSON.Dependencies["playwright-chromium"]; hasPlaywright {
+	if _, hasPlaywright := appPackageJSON.Dependencies["playwright-chromium"]; hasPlaywright {
 		*pw = optional.Some(true)
 		return pw.Unwrap()
 	}
 
-	if _, hasPlaywright := packageJSON.DevDependencies["playwright-chromium"]; hasPlaywright {
+	if _, hasPlaywright := appPackageJSON.DevDependencies["playwright-chromium"]; hasPlaywright {
 		*pw = optional.Some(true)
 		return pw.Unwrap()
 	}
@@ -299,10 +352,10 @@ func DetermineNeedPlaywright(ctx *nodePlanContext) bool {
 	return pw.Unwrap()
 }
 
-// GetBuildScript gets the build command in package.json's `scripts` of the Node.js project.
+// GetBuildScript gets the build command in package.json's `scripts` of the Node.js app.
 func GetBuildScript(ctx *nodePlanContext) string {
 	bs := &ctx.BuildScript
-	packageJSON := ctx.PackageJSON
+	packageJSON := ctx.GetAppPackageJSON()
 
 	if buildScript, err := bs.Take(); err == nil {
 		return buildScript
@@ -324,10 +377,11 @@ func GetBuildScript(ctx *nodePlanContext) string {
 	return bs.Unwrap()
 }
 
-// GetStartScript gets the start command in package.json's `scripts` of the Node.js project.
+// GetStartScript gets the start command in package.json's `scripts` of the Node.js app.
 func GetStartScript(ctx *nodePlanContext) string {
+	src, _ := ctx.GetAppSource()
 	ss := &ctx.StartScript
-	packageJSON := ctx.PackageJSON
+	packageJSON := ctx.GetAppPackageJSON()
 
 	if startScript, err := ss.Take(); err == nil {
 		return startScript
@@ -367,7 +421,7 @@ func GetStartScript(ctx *nodePlanContext) string {
 			} {
 				possibleEntrypoint := entrypoint + ext
 
-				if utils.HasFile(ctx.Src, possibleEntrypoint) {
+				if utils.HasFile(src, possibleEntrypoint) {
 					*ss = optional.Some(possibleEntrypoint)
 					return ss.Unwrap()
 				}
@@ -398,24 +452,24 @@ func getNodeVersion(versionConstraint string) string {
 // GetNodeVersion gets the Node.js version of the project.
 func GetNodeVersion(ctx *nodePlanContext) string {
 	src := ctx.Src
-	packageJSON := ctx.PackageJSON
+	packageJSON := ctx.ProjectPackageJSON
 	projectNodeVersion := packageJSON.Engines.Node
 
 	// If there are ".node-version" or ".nvmrc" file, we pick
 	// the version from them.
-	if content, err := afero.ReadFile(src, ".node-version"); err == nil {
+	if content, err := utils.ReadFileToUTF8(src, ".node-version"); err == nil {
 		projectNodeVersion = strings.TrimSpace(string(content))
 	}
-	if content, err := afero.ReadFile(src, ".nvmrc"); err == nil {
+	if content, err := utils.ReadFileToUTF8(src, ".nvmrc"); err == nil {
 		projectNodeVersion = strings.TrimSpace(string(content))
 	}
 
 	return getNodeVersion(projectNodeVersion)
 }
 
-// GetEntry gets the entry file of the Node.js project.
+// GetEntry gets the entry file of the Node.js app.
 func GetEntry(ctx *nodePlanContext) string {
-	packageJSON := ctx.PackageJSON
+	packageJSON := ctx.GetAppPackageJSON()
 	ent := &ctx.Entry
 
 	if entry, err := ent.Take(); err == nil {
@@ -426,10 +480,10 @@ func GetEntry(ctx *nodePlanContext) string {
 	return ent.Unwrap()
 }
 
-// GetInstallCmd gets the installation command of the Node.js project.
+// GetInstallCmd gets the installation command of the Node.js app.
 func GetInstallCmd(ctx *nodePlanContext) string {
 	cmd := &ctx.InstallCmd
-	src := ctx.Src
+	src, reldir := ctx.GetAppSource()
 
 	if installCmd, err := cmd.Take(); err == nil {
 		return installCmd
@@ -438,9 +492,20 @@ func GetInstallCmd(ctx *nodePlanContext) string {
 	pkgManager := DeterminePackageManager(ctx)
 	shouldCacheDependencies := plan.Cast(ctx.Config.Get(ConfigCacheDependencies), plan.ToWeakBoolE).TakeOr(true)
 
-	// monorepo
+	// disable cache_dependencies for monorepos
 	if shouldCacheDependencies && utils.HasFile(src, "pnpm-workspace.yaml", "pnpm-workspace.yml", "packages") {
 		log.Println("Detected Monorepo. Disabling dependency caching.")
+		shouldCacheDependencies = false
+	}
+
+	// disable cache_dependencies if the installation command is customized
+	installCmdConf := plan.Cast(ctx.Config.Get(plan.ConfigInstallCommand), cast.ToStringE)
+	if installCmdConf.IsSome() {
+		shouldCacheDependencies = false
+	}
+
+	// disable cache_dependencies if the app root != project root
+	if reldir != "" {
 		shouldCacheDependencies = false
 	}
 
@@ -453,18 +518,38 @@ func GetInstallCmd(ctx *nodePlanContext) string {
 	} else {
 		cmds = append(cmds, "COPY . .")
 	}
+	if reldir != "" {
+		cmds = append(cmds, "WORKDIR /src/"+reldir)
+	}
 
-	switch pkgManager {
-	case types.NodePackageManagerNpm:
-		cmds = append(cmds, "COPY package-lock.json* .", "RUN npm install")
-	case types.NodePackageManagerPnpm:
-		cmds = append(cmds, "COPY pnpm-lock.yaml* .", "RUN pnpm install")
-	case types.NodePackageManagerBun:
-		cmds = append(cmds, "COPY bun.lockb* .", "RUN bun install")
-	case types.NodePackageManagerYarn:
-		cmds = append(cmds, "COPY yarn.lock* .", "RUN yarn install")
-	default:
-		cmds = append(cmds, "RUN yarn install")
+	if installCmd, err := installCmdConf.Take(); err == nil {
+		cmds = append(cmds, "RUN "+installCmd)
+	} else {
+		switch pkgManager {
+		case types.NodePackageManagerNpm:
+			// FIXME: reldir != ""
+			if shouldCacheDependencies && reldir == "" {
+				cmds = append(cmds, "COPY package-lock.json* .")
+			}
+			cmds = append(cmds, "RUN npm install")
+		case types.NodePackageManagerPnpm:
+			if shouldCacheDependencies && reldir == "" {
+				cmds = append(cmds, "COPY pnpm-lock.yaml* .")
+			}
+			cmds = append(cmds, "RUN pnpm install")
+		case types.NodePackageManagerBun:
+			if shouldCacheDependencies && reldir == "" {
+				cmds = append(cmds, "COPY bun.lockb* .")
+			}
+			cmds = append(cmds, "RUN bun install")
+		case types.NodePackageManagerYarn:
+			if shouldCacheDependencies && reldir == "" {
+				cmds = append(cmds, "COPY yarn.lock* .")
+			}
+			cmds = append(cmds, "RUN yarn install")
+		default:
+			cmds = append(cmds, "RUN yarn install")
+		}
 	}
 
 	needPlaywright := DetermineNeedPlaywright(ctx)
@@ -486,7 +571,7 @@ func GetInstallCmd(ctx *nodePlanContext) string {
 	return cmd.Unwrap()
 }
 
-// GetBuildCmd gets the build command of the Node.js project.
+// GetBuildCmd gets the build command of the Node.js app.
 func GetBuildCmd(ctx *nodePlanContext) string {
 	cmd := &ctx.BuildCmd
 
@@ -519,7 +604,103 @@ func GetBuildCmd(ctx *nodePlanContext) string {
 	return cmd.Unwrap()
 }
 
-// GetStartCmd gets the start command of the Node.js project.
+// GetMonorepoAppRoot gets the app root of the monorepo project in the Node.js project.
+func GetMonorepoAppRoot(ctx *nodePlanContext) string {
+	if appDir, err := ctx.AppDir.Take(); err == nil {
+		return appDir
+	}
+
+	// If user has explicitly set the app directory, we should use it.
+	if userAppDir, err := plan.Cast(
+		ctx.Config.Get(ConfigAppDir), cast.ToStringE,
+	).Take(); err == nil && userAppDir != "" {
+		ctx.AppDir = optional.Some(userAppDir)
+		return ctx.AppDir.Unwrap()
+	}
+
+	// pnpm workspace
+	workspace, found := func() (string, bool) {
+		if workspaceYAML, err := afero.ReadFile(ctx.Src, "pnpm-workspace.yaml"); err == nil {
+			var pnpmWorkspace struct {
+				Packages []string `yaml:"packages"`
+			}
+
+			if err := yaml.Unmarshal(workspaceYAML, &pnpmWorkspace); err != nil {
+				log.Printf("failed to parse pnpm-workspace.yaml: %v", err)
+				return "", false
+			}
+
+			for _, pnpmPackagesGlob := range pnpmWorkspace.Packages {
+				match, err := FindAppDirByGlob(ctx.Src, pnpmPackagesGlob)
+				if err != nil {
+					log.Printf("failed to find the matched directory: %v", err)
+					continue
+				}
+				if match == "" {
+					log.Printf("no directory found in the workspace according this glob: %s", pnpmPackagesGlob)
+					continue
+				}
+
+				return match, true
+			}
+
+			return "", false
+		}
+
+		return "", false
+	}()
+	if found {
+		ctx.AppDir = optional.Some(workspace)
+		return ctx.AppDir.Unwrap()
+	}
+
+	// yarn workspace
+	workspace, found = func() (string, bool) {
+		if len(ctx.ProjectPackageJSON.Workspaces) == 0 {
+			return "", false
+		}
+
+		for _, workspaceGlob := range ctx.ProjectPackageJSON.Workspaces {
+			match, err := FindAppDirByGlob(ctx.Src, workspaceGlob)
+			if err != nil {
+				log.Printf("failed to find the matched directory: %v", err)
+				continue
+			}
+
+			return match, true
+		}
+
+		return "", false
+	}()
+	if found {
+		ctx.AppDir = optional.Some(workspace)
+		return ctx.AppDir.Unwrap()
+	}
+
+	ctx.AppDir = optional.Some("")
+	return ctx.AppDir.Unwrap()
+}
+
+// FindAppDirByGlob finds the application directory (with package.json) by the given glob pattern.
+func FindAppDirByGlob(fs afero.Fs, pattern string) (match string, fnerr error) {
+	matches, err := afero.Glob(fs, pattern)
+	if err != nil {
+		return "", err
+	}
+
+	for _, match := range matches {
+		if _, err := DeserializePackageJSON(afero.NewBasePathFs(fs, match)); err != nil {
+			fnerr = errors.Join(err, fmt.Errorf("deserialize package.json in %s: %w", match, err))
+			continue
+		}
+
+		return match, nil
+	}
+
+	return "", fnerr
+}
+
+// GetStartCmd gets the start command of the Node.js app.
 func GetStartCmd(ctx *nodePlanContext) string {
 	cmd := &ctx.StartCmd
 
@@ -535,7 +716,7 @@ func GetStartCmd(ctx *nodePlanContext) string {
 	startScript := GetStartScript(ctx)
 	pkgManager := DeterminePackageManager(ctx)
 	entry := GetEntry(ctx)
-	framework := DetermineProjectFramework(ctx)
+	framework := DetermineAppFramework(ctx)
 
 	var startCmd string
 	switch pkgManager {
@@ -579,22 +760,22 @@ func GetStartCmd(ctx *nodePlanContext) string {
 	return cmd.Unwrap()
 }
 
-// GetStaticOutputDir returns the output directory for static projects.
-// If empty string is returned, the service is not deployed as static files.
+// GetStaticOutputDir returns the output directory for static application.
+// If empty string is returned, the application is not deployed as static files.
 func GetStaticOutputDir(ctx *nodePlanContext) string {
 	dir := &ctx.StaticOutputDir
-	source := ctx.Src
+	source, _ := ctx.GetAppSource()
 
 	if outputDir, err := dir.Take(); err == nil {
 		return outputDir
 	}
 
-	framework := DetermineProjectFramework(ctx)
+	framework := DetermineAppFramework(ctx)
 
 	// the default output directory of Angular is `dist/<project-name>/browser`
 	// we need to find the project name from `angular.json`.
 	if framework == types.NodeProjectFrameworkAngular {
-		angularJSON, err := afero.ReadFile(source, "angular.json")
+		angularJSON, err := utils.ReadFileToUTF8(source, "angular.json")
 		if err != nil {
 			println("failed to read angular.json: " + err.Error())
 			*dir = optional.Some("dist")
@@ -665,7 +846,7 @@ func getServerless(ctx *nodePlanContext) bool {
 		return serverless
 	}
 
-	framework := DetermineProjectFramework(ctx)
+	framework := DetermineAppFramework(ctx)
 
 	defaultServerless := map[types.NodeProjectFramework]bool{
 		types.NodeProjectFrameworkNextJs:  true,
@@ -707,20 +888,23 @@ func GetMeta(opt GetMetaOptions) types.PlanMeta {
 	}
 
 	ctx := &nodePlanContext{
-		PackageJSON: packageJSON,
-		Config:      opt.Config,
-		Src:         opt.Src,
-		Bun:         opt.Bun,
+		ProjectPackageJSON: packageJSON,
+		Config:             opt.Config,
+		Src:                opt.Src,
+		Bun:                opt.Bun,
 	}
 
 	meta := types.PlanMeta{
 		"bun": strconv.FormatBool(opt.Bun),
 	}
 
+	_, reldir := ctx.GetAppSource()
+	meta["appDir"] = reldir
+
 	pkgManager := DeterminePackageManager(ctx)
 	meta["packageManager"] = string(pkgManager)
 
-	framework := DetermineProjectFramework(ctx)
+	framework := DetermineAppFramework(ctx)
 	meta["framework"] = string(framework)
 
 	nodeVersion := GetNodeVersion(ctx)

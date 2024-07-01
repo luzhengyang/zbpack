@@ -18,7 +18,6 @@ const DefaultPHPVersion = "8"
 
 // GetPHPVersion gets the php version of the project.
 func GetPHPVersion(config plan.ImmutableProjectConfiguration, source afero.Fs) string {
-
 	// Priority: config (environment variable) > docker-compose.yml > composer.json
 
 	// Get the PHP version from the config (php.version) or environment variable (ZBPACK_PHP_VERSION).
@@ -27,7 +26,7 @@ func GetPHPVersion(config plan.ImmutableProjectConfiguration, source afero.Fs) s
 	}
 
 	// if not found in the config or environment variable, try to get it from the docker-compose.yml because it may be a Laravel Sail project.
-	compose, err := afero.ReadFile(source, "docker-compose.yml")
+	compose, err := utils.ReadFileToUTF8(source, "docker-compose.yml")
 	if err == nil && strings.Contains(string(compose), "vendor/laravel/sail/runtimes") {
 		lines := strings.Split(string(compose), "\n")
 		for _, line := range lines {
@@ -70,6 +69,10 @@ func DetermineProjectFramework(source afero.Fs) types.PHPFramework {
 
 	if _, isCodeIgniter := composerJSON.GetRequire("codeigniter4/framework"); isCodeIgniter {
 		return types.PHPFrameworkCodeigniter
+	}
+
+	if _, isSymfony := composerJSON.GetRequire("symfony/runtime"); isSymfony {
+		return types.PHPFrameworkSymfony
 	}
 
 	return types.PHPFrameworkNone
@@ -176,6 +179,18 @@ func DetermineStartCommand(config plan.ImmutableProjectConfiguration, startComma
 	}
 
 	return "nginx; php-fpm"
+}
+
+// DetermineBuildCommand determines the build command of the project.
+func DetermineBuildCommand(config plan.ImmutableProjectConfiguration, buildCommand *string) string {
+	if buildCommand != nil {
+		return *buildCommand
+	}
+	if buildCommand, err := plan.Cast(config.Get(plan.ConfigBuildCommand), cast.ToStringE).Take(); err == nil {
+		return buildCommand
+	}
+
+	return ""
 }
 
 const (

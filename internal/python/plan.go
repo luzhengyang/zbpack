@@ -35,6 +35,10 @@ const (
 	// ConfigStreamlitEntry is the key for specifying the streamlit entry explicitly
 	// in the project configuration.
 	ConfigStreamlitEntry = "streamlit.entry"
+
+	// ConfigPythonVersion is the key for specifying the Python version explicitly
+	// in the project configuration.
+	ConfigPythonVersion = "python.version"
 )
 
 // DetermineFramework determines the framework of the Python project.
@@ -44,6 +48,11 @@ func DetermineFramework(ctx *pythonPlanContext) types.PythonFramework {
 
 	if framework, err := fw.Take(); err == nil {
 		return framework
+	}
+
+	if HasExplicitDependency(ctx, "reflex") {
+		*fw = optional.Some(types.PythonFrameworkReflex)
+		return fw.Unwrap()
 	}
 
 	if HasExplicitDependency(ctx, "django") {
@@ -171,7 +180,7 @@ func HasDependency(ctx *pythonPlanContext, dependency string) bool {
 // weakHasStringsInFiles checks if the specified text are in the listed files.
 func weakHasStringsInFiles(src afero.Fs, filelist []string, text string) bool {
 	for _, file := range filelist {
-		file, err := afero.ReadFile(src, file)
+		file, err := utils.ReadFileToUTF8(src, file)
 		if err != nil {
 			continue
 		}
@@ -200,7 +209,7 @@ func HasExplicitDependency(ctx *pythonPlanContext, dependency string) bool {
 
 // weakHasStringsInFile checks if the specified text are in the file.
 func weakHasStringsInFile(src afero.Fs, file string, text string) bool {
-	content, err := afero.ReadFile(src, file)
+	content, err := utils.ReadFileToUTF8(src, file)
 	if err != nil {
 		return false
 	}
@@ -260,7 +269,7 @@ func DetermineWsgi(ctx *pythonPlanContext) string {
 			entryFile := DetermineEntry(ctx)
 
 			re := regexp.MustCompile(`(\w+)\s*=\s*` + constructor + `\(`)
-			content, err := afero.ReadFile(src, entryFile)
+			content, err := utils.ReadFileToUTF8(src, entryFile)
 			if err != nil {
 				return ""
 			}
@@ -289,7 +298,7 @@ func getDjangoSettings(fs afero.Fs) ([]byte, error) {
 
 	// Generally, the "DJANGO_SETTINGS_MODULE" environment variable
 	// is defined in the "manage.py" file. So we read the manage.py first.
-	managePy, err := afero.ReadFile(fs, "manage.py")
+	managePy, err := utils.ReadFileToUTF8(fs, "manage.py")
 	if err != nil {
 		return nil, fmt.Errorf("read manage.py: %w", err)
 	}
@@ -308,7 +317,7 @@ func getDjangoSettings(fs afero.Fs) ([]byte, error) {
 
 	// We try to read the settings.py file declaring in the
 	// "DJANGO_SETTINGS_MODULE" environment variable.
-	settingsFile, err := afero.ReadFile(fs, filepath.Join(string(match[1]), "settings.py"))
+	settingsFile, err := utils.ReadFileToUTF8(fs, filepath.Join(string(match[1]), "settings.py"))
 	if err != nil {
 		return nil, fmt.Errorf("read settings.py: %w", err)
 	}
@@ -474,6 +483,11 @@ func determineAptDependencies(ctx *pythonPlanContext) []string {
 		return []string{}
 	}
 
+	framework := DetermineFramework(ctx)
+	if framework == types.PythonFrameworkReflex {
+		return []string{"caddy"}
+	}
+
 	deps := []string{"build-essential", "pkg-config"}
 
 	// If we need to host static files, we need nginx.
@@ -498,6 +512,14 @@ func determineAptDependencies(ctx *pythonPlanContext) []string {
 		deps = append(deps, "g++-7")
 	}
 
+	if HasDependency(ctx, "pyaudio") {
+		deps = append(deps, "portaudio19-dev")
+	}
+
+	if HasDependency(ctx, "azure-cognitiveservices-speech") {
+		deps = append(deps, "libssl-dev", "libasound2")
+	}
+
 	if determinePlaywright(ctx) {
 		deps = append(
 			deps, "libnss3", "libatk1.0-0", "libatk-bridge2.0-0",
@@ -511,6 +533,11 @@ func determineAptDependencies(ctx *pythonPlanContext) []string {
 }
 
 func determineStartCmd(ctx *pythonPlanContext) string {
+	// if "start_command" in `zbpack.json`, or "ZBPACK_START_COMMAND" in env, use it directly
+	if value, err := plan.Cast(ctx.Config.Get(plan.ConfigStartCommand), cast.ToStringE).Take(); err == nil {
+		return value
+	}
+
 	wsgi := DetermineWsgi(ctx)
 	framework := DetermineFramework(ctx)
 	pm := DeterminePackageManager(ctx)
@@ -520,6 +547,10 @@ func determineStartCmd(ctx *pythonPlanContext) string {
 	// serverless function doesn't need a start command
 	if serverless {
 		return ""
+	}
+
+	if framework == types.PythonFrameworkReflex {
+		return "[ -d alembic ] && reflex db migrate; caddy start && reflex run --env prod --backend-only --loglevel debug"
 	}
 
 	var commandSegment []string
@@ -564,6 +595,10 @@ func determineStartCmd(ctx *pythonPlanContext) string {
 
 // determinePythonVersion Determine Python Version
 func determinePythonVersion(ctx *pythonPlanContext) string {
+	if pythonVersion, err := plan.Cast(ctx.Config.Get(ConfigPythonVersion), cast.ToStringE).Take(); err == nil {
+		return getPython3Version(pythonVersion)
+	}
+
 	pm := DeterminePackageManager(ctx)
 
 	switch pm {
@@ -573,6 +608,8 @@ func determinePythonVersion(ctx *pythonPlanContext) string {
 		return determinePythonVersionWithPdm(ctx)
 	case types.PythonPackageManagerRye:
 		return determinePythonVersionWithRye(ctx)
+	case types.PythonPackageManagerPipenv:
+		return determinePythonVersionWithPipenv(ctx)
 	default:
 		return defaultPython3Version
 	}
@@ -581,7 +618,7 @@ func determinePythonVersion(ctx *pythonPlanContext) string {
 func determinePythonVersionWithPdm(ctx *pythonPlanContext) string {
 	src := ctx.Src
 
-	content, err := afero.ReadFile(src, "pyproject.toml")
+	content, err := utils.ReadFileToUTF8(src, "pyproject.toml")
 	if err != nil {
 		return defaultPython3Version
 	}
@@ -599,7 +636,7 @@ func determinePythonVersionWithPdm(ctx *pythonPlanContext) string {
 func determinePythonVersionWithPoetry(ctx *pythonPlanContext) string {
 	src := ctx.Src
 
-	content, err := afero.ReadFile(src, "pyproject.toml")
+	content, err := utils.ReadFileToUTF8(src, "pyproject.toml")
 	if err != nil {
 		return defaultPython3Version
 	}
@@ -624,7 +661,7 @@ func determinePythonVersionWithRye(ctx *pythonPlanContext) string {
 	src := ctx.Src
 	regex := regexp.MustCompile(`(?:.+?@)?([\d.]+)`)
 
-	content, err := afero.ReadFile(src, ".python-version")
+	content, err := utils.ReadFileToUTF8(src, ".python-version")
 	if err != nil {
 		return defaultPython3Version
 	}
@@ -637,14 +674,37 @@ func determinePythonVersionWithRye(ctx *pythonPlanContext) string {
 	return defaultPython3Version
 }
 
+func determinePythonVersionWithPipenv(ctx *pythonPlanContext) string {
+	src := ctx.Src
+
+	content, err := utils.ReadFileToUTF8(src, "Pipfile")
+	if err != nil {
+		return defaultPython3Version
+	}
+
+	compile := regexp.MustCompile(`python_version\s*=\s*"(.*?)"`)
+	submatchs := compile.FindStringSubmatch(string(content))
+	if len(submatchs) > 1 {
+		return submatchs[1]
+	}
+
+	return defaultPython3Version
+}
+
 func determineBuildCmd(ctx *pythonPlanContext) string {
 	commands := ""
 
 	packageManager := DeterminePackageManager(ctx)
 	staticInfo := DetermineStaticInfo(ctx)
+	framework := DetermineFramework(ctx)
 
 	if postInstallCmd := getPmPostInstallCmd(packageManager); postInstallCmd != "" {
 		commands += "RUN " + postInstallCmd + "\n"
+	}
+
+	if framework == types.PythonFrameworkReflex {
+		commands += `RUN reflex init
+RUN reflex export --frontend-only --no-zip && mv .web/_static/* /srv/ && rm -rf .web`
 	}
 
 	if staticInfo.DjangoEnabled() {
@@ -678,7 +738,7 @@ func determineStreamlitEntry(ctx *pythonPlanContext) string {
 	}
 
 	for _, file := range []string{"app.py", "main.py", "streamlit_app.py"} {
-		content, err := afero.ReadFile(src, file)
+		content, err := utils.ReadFileToUTF8(src, file)
 		if err == nil && bytes.Contains(content, []byte("import streamlit")) {
 			*se = optional.Some(file)
 			return se.Unwrap()

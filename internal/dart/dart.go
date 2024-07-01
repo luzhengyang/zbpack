@@ -8,13 +8,19 @@ import (
 
 // GenerateDockerfile generates the Dockerfile for Dart projects.
 func GenerateDockerfile(meta types.PlanMeta) (string, error) {
+	build := meta["build"]
+
 	if meta["framework"] == "flutter" {
-		return `FROM zeabur/flutter
+		return `FROM ubuntu:latest
+RUN apt-get update && apt-get install -y curl git unzip xz-utils zip libglu1-mesa
+RUN git clone https://github.com/flutter/flutter.git /usr/local/flutter
+ENV PATH="/usr/local/flutter/bin:/usr/local/flutter/bin/cache/dart-sdk/bin:${PATH}"
+RUN flutter config --enable-web
 WORKDIR /app
 COPY . .
 RUN flutter clean
 RUN flutter pub get
-RUN flutter build web
+` + build + `
 
 FROM scratch
 COPY --from=0 /app/build/web /
@@ -26,14 +32,14 @@ COPY --from=0 /app/build/web /
 WORKDIR /app
 COPY . .
 RUN dart pub get
-RUN dart compile exe bin/main.dart -o bin/main
+` + build + `
 CMD ["/app/bin/main", "--apply-migrations"]
 `, nil
 	}
 
 	return `FROM dart:stable-sdk
 RUN dart pub get
-RUN dart compile exe bin/main.dart
+` + build + `
 
 FROM alpine:latest
 COPY --from=0 /app/bin/main /main

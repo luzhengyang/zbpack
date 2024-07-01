@@ -25,6 +25,15 @@ type NewPlannerOptions struct {
 	CustomBuildCommand *string
 	CustomStartCommand *string
 	OutputDir          *string
+
+	AWSConfig *AWSConfig
+}
+
+// AWSConfig is the AWS configuration for fetching projects from S3 bucket.
+type AWSConfig struct {
+	Region          string
+	AccessKeyID     string
+	SecretAccessKey string
 }
 
 // NewPlanner creates a new Planner.

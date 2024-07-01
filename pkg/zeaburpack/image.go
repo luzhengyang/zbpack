@@ -83,11 +83,6 @@ func buildImage(opt *buildImageOptions) error {
 	// build the dockerfile
 	dockerfileEnv := ""
 
-	// Inject CI env so everyone knows that we are a CI.
-	if _, ok := resolvedVars["CI"]; !ok {
-		dockerfileEnv += "ENV CI true\n"
-	}
-
 	for _, key := range sortedResolvedVarsKey {
 		value := resolvedVars[key]
 
@@ -96,12 +91,12 @@ func buildImage(opt *buildImageOptions) error {
 			continue
 		}
 
+		value = strings.ReplaceAll(value, "\\", "\\\\")
 		value = strings.ReplaceAll(value, "\n", "\\n")
 		value = strings.ReplaceAll(value, "'", "\\'")
 		value = strings.ReplaceAll(value, "\"", "\\\"")
-		value = strings.ReplaceAll(value, "\\", "\\\\")
 
-		dockerfileEnv += "ENV " + key + " \"" + value + "\"\n"
+		dockerfileEnv += "ENV " + key + "=\"" + value + "\"\n"
 	}
 
 	for _, stageLine := range stageLines {

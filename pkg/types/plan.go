@@ -85,6 +85,7 @@ const (
 	NodeProjectFrameworkNueJs            NodeProjectFramework = "nuejs"
 	NodeProjectFrameworkVocs             NodeProjectFramework = "vocs"
 	NodeProjectFrameworkRspress          NodeProjectFramework = "rspress"
+	NodeProjectFrameworkGrammY           NodeProjectFramework = "grammy"
 )
 
 //revive:enable:exported
@@ -103,6 +104,9 @@ const (
 
 	// PythonFrameworkStreamlit https://github.com/streamlit/streamlit
 	PythonFrameworkStreamlit PythonFramework = "streamlit"
+
+	// PythonFrameworkReflex https://github.com/reflex-dev/reflex
+	PythonFrameworkReflex PythonFramework = "reflex"
 )
 
 //revive:enable:exported
@@ -162,6 +166,7 @@ const (
 	PHPFrameworkNone        PHPFramework = "none"
 	PHPFrameworkThinkphp    PHPFramework = "thinkphp"
 	PHPFrameworkCodeigniter PHPFramework = "codeigniter"
+	PHPFrameworkSymfony     PHPFramework = "symfony"
 )
 
 //revive:enable:exported
